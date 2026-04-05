@@ -1,4 +1,4 @@
-"""Monte Carlo equity calculators with multiprocessing.
+"""Monte Carlo equity calculators with multiprocessing and optional GPU.
 
 Three levels of sophistication, all sharing the same core MC engine:
 
@@ -8,22 +8,24 @@ Three levels of sophistication, all sharing the same core MC engine:
 3. :func:`compute_equity_per_combo` – per-combo equity for opponent-response
                                       modelling.
 
-All heavy lifting is done on CPU tensors.  When *n_workers* > 1 the
-iterations are split across ``torch.multiprocessing`` workers for parallel
-execution on multi-core machines.
+All heavy lifting is done on tensors.  When *device* is ``"cpu"`` and
+*n_workers* > 1 the iterations are split across ``torch.multiprocessing``
+workers for parallel execution on multi-core machines.  When *device* is
+``"cuda"`` (or any non-CPU device), multiprocessing is **skipped** and the
+GPU handles the parallelism natively — this is typically 10-50× faster.
 
 Pool management
 ---------------
 Use :func:`get_pool` / :func:`shutdown_pool` to manage a persistent worker
 pool that avoids the overhead of process creation on every call.  The pool
-is lazily created on first use.
+is lazily created on first use and **only** used in CPU mode.
 """
 
 from __future__ import annotations
 
 import atexit
 import os
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -31,15 +33,31 @@ import torch.multiprocessing as mp
 
 from solver.evaluator import evaluate_hands
 
-# Maximum evaluations per batch (tune to stay within CPU cache / RAM).
+# Maximum evaluations per batch (tune to stay within CPU cache / GPU VRAM).
 _MAX_BATCH: int = 50_000
 
-# Default number of workers (0 = use all cores).
+# Default number of workers (0 = use all cores, ignored on GPU).
 _DEFAULT_WORKERS: int = int(os.environ.get("SOLVER_WORKERS", "0"))
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Persistent worker pool
+# Device helper
+# ═══════════════════════════════════════════════════════════════════════
+
+DeviceLike = Union[str, torch.device, None]
+
+
+def _resolve_device(device: DeviceLike) -> torch.device:
+    """Normalise a device specification to a ``torch.device``."""
+    if device is None:
+        return torch.device("cpu")
+    if isinstance(device, str):
+        return torch.device(device)
+    return device
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Persistent worker pool (CPU only)
 # ═══════════════════════════════════════════════════════════════════════
 
 _pool: Optional[mp.pool.Pool] = None
@@ -94,6 +112,7 @@ def compute_equity(
     n_opponents: int = 1,
     n_iters: int = 10_000,
     n_workers: int = _DEFAULT_WORKERS,
+    device: DeviceLike = None,
 ) -> float:
     """Hero equity via MC against *n_opponents* random hands.
 
@@ -102,24 +121,29 @@ def compute_equity(
     hero_cards  : (2,) long – hero card IDs.
     board_cards : (B,) long – board card IDs, B ∈ {0, 3, 4, 5}.
     n_opponents : 1-5.
-    n_iters     : total MC iterations (split across workers).
-    n_workers   : parallel workers; 0 = ``os.cpu_count()``.
+    n_iters     : total MC iterations (split across workers on CPU).
+    n_workers   : parallel workers; 0 = ``os.cpu_count()`` (CPU only).
+    device      : ``"cpu"`` (default), ``"cuda"``, etc.
 
     Returns
     -------
     Equity as a float in [0, 1].
     """
+    dev = _resolve_device(device)
     n_workers = _resolve_workers(n_workers)
 
-    if n_workers <= 1:
+    # GPU or single-worker CPU: run in-process
+    if dev.type != "cpu" or n_workers <= 1:
         return _basic_equity_chunk(hero_cards, board_cards,
-                                   n_opponents, n_iters)
+                                   n_opponents, n_iters, dev)
 
+    # multi-worker CPU: use pool
+    cpu = torch.device("cpu")
     chunks = _split_iters(n_iters, n_workers)
     pool = get_pool(n_workers)
     results = pool.starmap(
         _basic_equity_chunk,
-        [(hero_cards, board_cards, n_opponents, c) for c in chunks],
+        [(hero_cards, board_cards, n_opponents, c, cpu) for c in chunks],
     )
     # weighted average (chunks may differ by ±1)
     total = sum(eq * c for eq, c in zip(results, chunks))
@@ -131,9 +155,9 @@ def _basic_equity_chunk(
     board_cards: torch.Tensor,
     n_opponents: int,
     n_iters: int,
+    device: torch.device = torch.device("cpu"),
 ) -> float:
     """Single-worker MC equity vs random opponents."""
-    device = torch.device("cpu")
     hero = hero_cards.to(device)
     board = board_cards.to(device) if len(board_cards) > 0 else torch.tensor(
         [], dtype=torch.long, device=device
@@ -205,6 +229,7 @@ def compute_equity_vs_ranges(
     n_iters: int = 10_000,
     combo_weights: Optional[list[Optional[torch.Tensor]]] = None,
     n_workers: int = _DEFAULT_WORKERS,
+    device: DeviceLike = None,
 ) -> float:
     """Hero equity vs opponents sampled from provided ranges.
 
@@ -215,25 +240,30 @@ def compute_equity_vs_ranges(
     opponent_combos  : list of (n_combos_i, 2) long tensors per opponent.
     n_iters          : total MC iterations.
     combo_weights    : optional per-opponent (n_combos_i,) weight tensors.
-    n_workers        : parallel workers; 0 = all cores.
+    n_workers        : parallel workers; 0 = all cores (CPU only).
+    device           : ``"cpu"`` (default), ``"cuda"``, etc.
 
     Returns
     -------
     Equity float in [0, 1].
     """
+    dev = _resolve_device(device)
     n_workers = _resolve_workers(n_workers)
 
-    if n_workers <= 1:
+    # GPU or single-worker CPU: run in-process
+    if dev.type != "cpu" or n_workers <= 1:
         return _range_equity_chunk(
-            hero_cards, board_cards, opponent_combos, n_iters, combo_weights,
+            hero_cards, board_cards, opponent_combos, n_iters, combo_weights, dev,
         )
 
+    # multi-worker CPU: use pool
+    cpu = torch.device("cpu")
     chunks = _split_iters(n_iters, n_workers)
     pool = get_pool(n_workers)
     results = pool.starmap(
         _range_equity_chunk,
         [
-            (hero_cards, board_cards, opponent_combos, c, combo_weights)
+            (hero_cards, board_cards, opponent_combos, c, combo_weights, cpu)
             for c in chunks
         ],
     )
@@ -247,9 +277,9 @@ def _range_equity_chunk(
     opponent_combos: list[torch.Tensor],
     n_iters: int,
     combo_weights: Optional[list[Optional[torch.Tensor]]] = None,
+    device: torch.device = torch.device("cpu"),
 ) -> float:
     """Single-worker range-aware MC equity."""
-    device = torch.device("cpu")
     hero = hero_cards.to(device)
     board = (
         board_cards.to(device)
@@ -349,6 +379,7 @@ def compute_equity_per_combo(
     opponent_combos: torch.Tensor,
     n_iters_per_combo: int = 30,
     n_workers: int = _DEFAULT_WORKERS,
+    device: DeviceLike = None,
 ) -> torch.Tensor:
     """Hero equity against each individual opponent combo.
 
@@ -360,29 +391,33 @@ def compute_equity_per_combo(
     board_cards       : (B,) long, B ∈ {0, 3, 4, 5}.
     opponent_combos   : (n_combos, 2) long – single opponent's range.
     n_iters_per_combo : board samples per combo.
-    n_workers         : parallel workers; 0 = all cores.
+    n_workers         : parallel workers; 0 = all cores (CPU only).
+    device            : ``"cpu"`` (default), ``"cuda"``, etc.
 
     Returns
     -------
     (n_combos,) float tensor of hero equity per combo.
     """
+    dev = _resolve_device(device)
     n_combos = opponent_combos.shape[0]
     if n_combos == 0:
-        return torch.tensor([], dtype=torch.float32)
+        return torch.tensor([], dtype=torch.float32, device=dev)
 
     n_workers = _resolve_workers(n_workers)
 
-    # split combos across workers (not iters, to keep per-combo grouping)
-    if n_workers <= 1 or n_combos < n_workers:
+    # GPU or single-worker CPU: run in-process
+    if dev.type != "cpu" or n_workers <= 1 or n_combos < n_workers:
         return _per_combo_batch(hero_cards, board_cards,
-                                opponent_combos, n_iters_per_combo)
+                                opponent_combos, n_iters_per_combo, dev)
 
+    # multi-worker CPU: split combos across workers
+    cpu = torch.device("cpu")
     combo_chunks = _split_combos(opponent_combos, n_workers)
     pool = get_pool(n_workers)
     results = pool.starmap(
         _per_combo_batch,
         [
-            (hero_cards, board_cards, chunk, n_iters_per_combo)
+            (hero_cards, board_cards, chunk, n_iters_per_combo, cpu)
             for chunk in combo_chunks
         ],
     )
@@ -394,9 +429,9 @@ def _per_combo_batch(
     board_cards: torch.Tensor,
     combos: torch.Tensor,
     n_iters_per_combo: int,
+    device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
     """Per-combo equity for a batch of combos (single worker)."""
-    device = torch.device("cpu")
     hero = hero_cards.to(device)
     board = (
         board_cards.to(device)
@@ -410,10 +445,13 @@ def _per_combo_batch(
     n_board_needed = 5 - n_board
     total = n_combos * n_iters_per_combo
 
+    # On GPU, allow larger batches (GPU VRAM handles it)
+    max_batch = _MAX_BATCH if device.type == "cpu" else _MAX_BATCH * 10
+
     # process in sub-batches if very large
-    if total > _MAX_BATCH:
+    if total > max_batch:
         results = []
-        batch_combos = max(1, _MAX_BATCH // n_iters_per_combo)
+        batch_combos = max(1, max_batch // n_iters_per_combo)
         for start in range(0, n_combos, batch_combos):
             end = min(start + batch_combos, n_combos)
             chunk_eq = _per_combo_inner(

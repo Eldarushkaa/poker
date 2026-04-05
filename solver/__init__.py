@@ -1,4 +1,4 @@
-"""GTO poker solver — CPU-optimised with multiprocessing.
+"""GTO poker solver — CPU/GPU with multiprocessing.
 
 Public API
 ----------
@@ -35,6 +35,7 @@ Public API
 
 from solver.evaluator import evaluate_hands
 from solver.equity import (
+    DeviceLike,
     compute_equity,
     compute_equity_per_combo,
     compute_equity_vs_ranges,
@@ -55,6 +56,7 @@ __all__ = [
     # evaluator
     "evaluate_hands",
     # equity
+    "DeviceLike",
     "compute_equity",
     "compute_equity_vs_ranges",
     "compute_equity_per_combo",

@@ -10,6 +10,10 @@ Merges the three levels from the original solver versions:
 The main entry point is :func:`compute_ev` which accepts **multiple
 raise fractions** in a single call so that the expensive equity / per-combo
 response computation is done only once and reused across all sizings.
+
+Supports an optional *device* parameter (``"cpu"`` or ``"cuda"``) that is
+forwarded to the equity layer.  On GPU the multiprocessing pool is bypassed
+and the GPU handles parallelism natively.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from typing import Optional
 import torch
 
 from solver.equity import (
+    DeviceLike,
     compute_equity_per_combo,
     compute_equity_vs_ranges,
 )
@@ -76,6 +81,7 @@ def compute_ev(
     raise_frac: float | None = None,
     n_iters: int = 3_000,
     n_workers: int = 0,
+    device: DeviceLike = None,
     # positional / EQR
     hero_position: int = 0,
     street: int = 0,
@@ -108,7 +114,8 @@ def compute_ev(
     raise_frac    : single raise fraction (legacy compat). Ignored if
                     raise_fracs is provided.
     n_iters       : MC iterations for equity.
-    n_workers     : parallel workers (0 = all cores).
+    n_workers     : parallel workers (0 = all cores, CPU only).
+    device        : ``"cpu"`` (default), ``"cuda"``, etc.
     hero_position : seat index.
     street        : 0 = preflop … 3 = river.
     n_players     : table size.
@@ -167,6 +174,7 @@ def compute_ev(
 
     raw_eq = compute_equity_vs_ranges(
         hero_cards, board_cards, opp_combos, n_iters, cw, n_workers,
+        device=device,
     )
     eff_eq = _clamp_equity(raw_eq * eqr)
 
@@ -180,7 +188,7 @@ def compute_ev(
         primary = opp_combos[primary_idx]
         hero_eq_per = compute_equity_per_combo(
             hero_cards, board_cards, primary,
-            combo_response_iters, n_workers,
+            combo_response_iters, n_workers, device=device,
         )
         opp_eq_per = 1.0 - hero_eq_per
 
@@ -240,6 +248,7 @@ def compute_ev(
 
                 eq_callers = compute_equity_vs_ranges(
                     hero_cards, board_cards, all_calling, n_iters, call_cw, n_workers,
+                    device=device,
                 )
             else:
                 eq_callers = raw_eq
