@@ -13,8 +13,9 @@ NL Texas Hold'em 6-max poker bot built in 7 phases:
 
 ## Environment
 
-- **VPS**: No GPU, 8 CPU guaranteed (64 limit on weekends)
-- **Framework**: PyTorch CPU + multiprocessing
+- **VPS (macOS/Linux)**: No GPU, 8 CPU guaranteed (64 limit on weekends)
+- **Windows PC**: RTX 3060 Ti GPU (CUDA)
+- **Framework**: PyTorch CPU + multiprocessing (VPS) / PyTorch CUDA (Windows)
 - **Python**: 3.10+
 
 ## Project Structure
@@ -23,10 +24,11 @@ NL Texas Hold'em 6-max poker bot built in 7 phases:
 poker_bot/
 ├── solver/
 │   ├── __init__.py          # public API + pool management exports
-│   ├── evaluator.py         # vectorized 7-card hand evaluator
-│   ├── equity.py            # Monte Carlo equity + persistent worker pool
+│   ├── evaluator.py         # vectorized 7-card hand evaluator (CPU/GPU)
+│   ├── equity.py            # Monte Carlo equity + persistent worker pool + GPU
 │   ├── ranges.py            # 169 hand types, position ranges, narrowing
-│   └── ev.py                # multi-raise EV with shared equity computation
+│   ├── ev.py                # multi-raise EV with shared equity computation
+│   └── batch_solver.py      # batched GPU solver (N situations → 3 kernel launches)
 ├── simulator/
 │   ├── __init__.py
 │   ├── situation_gen.py     # random situation generator with action narrowing
@@ -192,7 +194,13 @@ Full 6-max game engine:
 
 ## Performance Notes
 
-- Solver MC: 8-core multiprocessing, ~10k iters split into 8 chunks
+- Solver MC (CPU): 8-core multiprocessing, iters split into 8 chunks
+- Solver MC (GPU): batched across situations, ~3 evaluate_hands mega-calls
+  per batch of 100 situations, bypasses multiprocessing entirely
+- CPU throughput: ~1,400 sit/min (8-core multiprocessing) or ~2,400 sit/min
+  (batch solver, single-core)
+- GPU throughput: ~5,000-15,000+ sit/min (RTX 3060 Ti, batch solver)
 - Neural net inference: ~1ms per decision on CPU
-- Dataset generation: parallelized across cores
+- Dataset generation: ``--device cpu`` (VPS) or ``--device cuda`` (GPU PC)
+- Both machines can run simultaneously — merge JSONL files afterwards
 - Genetic algo: games can run in parallel across cores

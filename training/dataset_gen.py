@@ -59,6 +59,7 @@ from pathlib import Path
 import torch
 
 from simulator.situation_gen import Situation, generate_situation
+from solver.batch_solver import batch_solve_situations
 from solver.ev import compute_ev
 from solver.equity import shutdown_pool
 from training.telegram import TelegramNotifier
@@ -380,22 +381,46 @@ def run(
     errors = 0
 
     try:
+        use_batch_gpu = (device != "cpu")
+
         while total < target and not _shutdown_requested:
             batch_records: list[str] = []
             batch_start = time.time()
 
-            for _ in range(batch_size):
-                if _shutdown_requested:
-                    break
+            if use_batch_gpu:
+                # ── GPU batch path: generate all situations, solve in one batched call ──
+                sits = []
+                for _ in range(batch_size):
+                    if _shutdown_requested:
+                        break
+                    sits.append(generate_situation())
 
-                sit = generate_situation()
-                record = solve_situation(sit, n_iters=n_iters,
-                                         n_workers=n_workers,
-                                         device=device)
-                if record is not None:
-                    batch_records.append(json.dumps(record, separators=(",", ":")))
-                else:
-                    errors += 1
+                if sits and not _shutdown_requested:
+                    records = batch_solve_situations(
+                        sits,
+                        raise_fracs=list(RAISE_FRACS),
+                        n_iters=n_iters,
+                        device=device,
+                    )
+                    for rec in records:
+                        if rec is not None:
+                            batch_records.append(json.dumps(rec, separators=(",", ":")))
+                        else:
+                            errors += 1
+            else:
+                # ── CPU path: solve one at a time with multiprocessing ──
+                for _ in range(batch_size):
+                    if _shutdown_requested:
+                        break
+
+                    sit = generate_situation()
+                    record = solve_situation(sit, n_iters=n_iters,
+                                             n_workers=n_workers,
+                                             device=device)
+                    if record is not None:
+                        batch_records.append(json.dumps(record, separators=(",", ":")))
+                    else:
+                        errors += 1
 
             # flush batch to disk
             if batch_records:
@@ -456,8 +481,8 @@ def main() -> None:
                         help="MC iterations per solver call (default: 3000)")
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers; 0 = all cores (default: 0)")
-    parser.add_argument("--tg-interval", type=float, default=60.0,
-                        help="Telegram notification interval in seconds (default: 60)")
+    parser.add_argument("--tg-interval", type=float, default=600.0,
+                        help="Telegram notification interval in seconds (default: 600)")
     parser.add_argument("--device", type=str, default="cpu",
                         choices=["cpu", "cuda"],
                         help="Device for MC simulations: cpu or cuda (default: cpu)")
